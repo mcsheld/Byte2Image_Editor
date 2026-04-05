@@ -42,7 +42,6 @@
 
 1. **Клонируйте репозиторий**
 
-```bash
 git clone https://github.com/mcsheld/Byte2Image_Editor.git
 cd Byte2Image_Editor
 

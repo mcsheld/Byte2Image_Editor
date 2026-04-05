@@ -42,13 +42,18 @@
 
 1. **Клонируйте репозиторий**
 
+``` bash
 git clone https://github.com/mcsheld/Byte2Image_Editor.git
 cd Byte2Image_Editor
+```
 
 2. **Установите зависимости**
 
+``` bash
 pip install numpy pillow
+```
 
 3. **Запуск программы**
+``` bash
 python Byte2Image_Editor.py
-
+```

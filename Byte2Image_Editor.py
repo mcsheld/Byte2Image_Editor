@@ -85,8 +85,8 @@ class ImageDisplayApp:
         # Переменные
         self.screen_width = 160
         self.screen_height = 160
-        self.scale_factors = [5, 8, 12, 15, 20, 25, 30]
-        self.current_scale_index = 0  # По умолчанию 5x (первый элемент)
+        self.scale_factors = [1, 2, 3, 5, 8, 12, 15, 20, 25, 30]
+        self.current_scale_index = 3  # По умолчанию 5x (первый элемент)
         self.scale_factor = self.scale_factors[self.current_scale_index]
         
         # Система слоев
@@ -1172,6 +1172,9 @@ class ImageDisplayApp:
         m.add_command(label="○  Hide All Layers",      command=self.hide_all_layers)
 
         m.add_separator()
+        
+        m.add_command(label="◎  Center on Layer", command=self.center_on_output_area)
+        m.add_separator()
 
         # Редактирование
         m.add_command(label="✎  Rename Layer",
@@ -1350,46 +1353,7 @@ class ImageDisplayApp:
 
     # === КОНЕЦ CANVAS DRAG & DROP ===
 
-    def on_canvas_right_click(self, event):
-        """Контекстное меню по правой кнопке на canvas."""
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        px = int(cx) // self.scale_factor
-        py = int(cy) // self.scale_factor
-        sf = self.scale_factor
-
-    def on_canvas_right_click(self, event):
-        """Контекстное меню по правой кнопке на canvas."""
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        px = int(cx) // self.scale_factor
-        py = int(cy) // self.scale_factor
-        sf = self.scale_factor
-
-        # Собираем ВСЕ слои под курсором (сверху вниз по z-order)
-        hit_indices = []
-        for i in range(len(self.layers) - 1, -1, -1):
-            layer = self.layers[i]
-            if layer.image_params is None:
-                continue
-            x_start, block_start, x_end, block_end = layer.image_params
-            lx1 = x_start * sf
-            ly1 = block_start * 8 * sf
-            lx2 = (x_end + 1) * sf
-            ly2 = (block_end * 8 + 8) * sf
-            if lx1 <= cx <= lx2 and ly1 <= cy <= ly2:
-                hit_indices.append(i)
-
-        # Топовый слой под курсором (первый в списке = верхний)
-        hit_index     = hit_indices[0] if hit_indices else -1
-        target_index  = hit_index if hit_index >= 0 else self.active_layer_index
-        target_layer  = self.layers[target_index] if target_index >= 0 and self.layers else None
-        is_active     = (target_index == self.active_layer_index)
-        has_image     = target_layer is not None and target_layer.image_array is not None
-
-        m = tk.Menu(self.root, tearoff=0)
-
-        # ── Select ────────────────────────────────────────────
+    # ── Select ────────────────────────────────────────────
     def on_canvas_right_click(self, event):
         """Контекстное меню по правой кнопке на canvas."""
         cx = self.canvas.canvasx(event.x)
@@ -2381,6 +2345,10 @@ class ImageDisplayApp:
     
     def draw_grid(self):
         self.clear_grid()
+        
+        # При малом масштабе сетка не нужна — пиксели и так не видны
+        if self.scale_factor < 3:
+            return
         
         canvas_width = self.screen_width * self.scale_factor
         canvas_height = self.screen_height * self.scale_factor

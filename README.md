@@ -1,4 +1,4 @@
-**Languages:** [🇬🇧](./README.md) | [🇷🇺](./README.ru.md)
+**Languages:** [🇬🇧](./README.md) | [🇷🇺](./README_RU.md)
 
 # Byte2Image Editor
 

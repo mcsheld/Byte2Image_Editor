@@ -51,6 +51,7 @@ The editor supports the specific data format used in DENSO monochrome instrument
 ```bash
 git clone https://github.com/mcsheld/Byte2Image_Editor.git
 cd Byte2Image_Editor
+```
 
 2. **Install dependencies**
 

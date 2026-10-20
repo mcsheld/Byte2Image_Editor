@@ -131,7 +131,12 @@ class ImageDisplayApp:
         self.edit_mode = False
         self.highlight_on_select = tk.BooleanVar(value=True)
         self.show_layer_borders = tk.BooleanVar(value=True)
-        
+        # Видимость панелей (View → Panels). Active Layer Hex скрыта по умолчанию.
+        self.show_toolbar = tk.BooleanVar(value=True)
+        self.show_layers_panel = tk.BooleanVar(value=True)
+        self.show_hex_panel = tk.BooleanVar(value=True)
+        self.show_log_panel = tk.BooleanVar(value=True)
+
         # Цвета для редактирования
         self.edit_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
         self.current_color_index = 0
@@ -745,7 +750,13 @@ class ImageDisplayApp:
         file_menu.add_command(label="Load Project...", command=self.load_project)
         file_menu.add_command(label="Close Project", command=self.close_project)
         file_menu.add_separator()
-        file_menu.add_command(label="Export Image...", command=self.export_to_image)
+        export_menu = Menu(file_menu, tearoff=0)
+        export_menu.add_command(label="Image (All Layers)...", command=self.export_to_image)
+        export_menu.add_command(label="Layer Image...", command=self.export_layer_image)
+        export_menu.add_command(label="Layer Bytes...", command=self.export_layer_bytes)
+        export_menu.add_separator()
+        export_menu.add_command(label="Firmware Structures...", command=self.show_firmware_export_dialog)
+        file_menu.add_cascade(label="Export", menu=export_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         
@@ -783,6 +794,17 @@ class ImageDisplayApp:
         view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
         view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
         view_menu.add_separator()
+        panels_menu = Menu(view_menu, tearoff=0)
+        panels_menu.add_checkbutton(label="Toolbar", variable=self.show_toolbar,
+                                    command=self.apply_panel_visibility)
+        panels_menu.add_checkbutton(label="Layers", variable=self.show_layers_panel,
+                                    command=self.apply_panel_visibility)
+        panels_menu.add_checkbutton(label="Active Layer Hex", variable=self.show_hex_panel,
+                                    command=self.apply_panel_visibility)
+        panels_menu.add_checkbutton(label="Log", variable=self.show_log_panel,
+                                    command=self.apply_panel_visibility)
+        view_menu.add_cascade(label="Panels", menu=panels_menu)
+        view_menu.add_separator()
         view_menu.add_command(label="Screen Size...", command=self.show_screen_size_dialog)
         
         # Меню Help
@@ -792,6 +814,914 @@ class ImageDisplayApp:
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self.show_about)
         
+    @staticmethod
+    def _set_pane_visible(paned, widget, ordered, weight, visible):
+        """Показывает/скрывает дочернюю панель PanedWindow, сохраняя исходный порядок.
+        ordered — список всех панелей этого paned в их «естественном» порядке."""
+        current = [str(p) for p in paned.panes()]
+        shown = str(widget) in current
+        if visible and not shown:
+            idx = 0
+            for w in ordered:
+                if w is widget:
+                    break
+                if str(w) in current:
+                    idx += 1
+            if idx >= len(current):
+                # Tk не позволяет insert с индексом == числу панелей — добавляем в конец
+                paned.add(widget, weight=weight)
+            else:
+                paned.insert(idx, widget, weight=weight)
+        elif not visible and shown:
+            paned.forget(widget)
+
+    def apply_panel_visibility(self):
+        """Применяет состояние View → Panels: Toolbar, Layers, Active Layer Hex, Log."""
+        # Тулбар (grid_remove запоминает параметры, grid() возвращает на место)
+        if self.show_toolbar.get():
+            self.toolbar_frame.grid()
+        else:
+            self.toolbar_frame.grid_remove()
+
+        main_order = [self.left_frame, self.center_paned, self.right_frame]
+        self._set_pane_visible(self.main_paned, self.left_frame, main_order, 1,
+                               self.show_layers_panel.get())
+        self._set_pane_visible(self.main_paned, self.right_frame, main_order, 1,
+                               self.show_log_panel.get())
+
+        self._set_pane_visible(self.center_paned, self.hex_frame,
+                               [self.center_top, self.hex_frame], 1,
+                               self.show_hex_panel.get())
+
+    def _build_export_menu(self, parent, layer=None):
+        """Подменю Export для контекстных меню. layer — слой, к которому относятся
+        пункты Layer Image / Layer Bytes (None — пункты отключены)."""
+        sub = Menu(parent, tearoff=0)
+        has_img = layer is not None and layer.image_params is not None \
+            and layer.image_data is not None
+        sub.add_command(label="Image (All Layers)...", command=self.export_to_image,
+                        state=tk.NORMAL if self.combined_image is not None else tk.DISABLED)
+        sub.add_command(label="Layer Image...", command=self.export_layer_image,
+                        state=tk.NORMAL if has_img else tk.DISABLED)
+        sub.add_command(label="Layer Bytes...", command=self.export_layer_bytes,
+                        state=tk.NORMAL if has_img else tk.DISABLED)
+        return sub
+
+    # ==================== ЭКСПОРТ В ПРОШИВКУ ====================
+
+    @staticmethod
+    def _addr_to_ptr_bytes(addr):
+        """24-битный адрес -> 4 байта в обратном порядке: 0xFB0000 -> 00 00 FB 00."""
+        return bytes([addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF, 0x00])
+
+    @staticmethod
+    def _fmt_addr(addr):
+        return f"{(addr >> 16) & 0xFF:02X}:{addr & 0xFFFF:04X}"
+
+    @staticmethod
+    def _parse_addr(text):
+        """Принимает 'FB0000', '0xFB0000' или 'FB:0000'. Возвращает int или None."""
+        t = text.strip().replace(':', '').replace(' ', '')
+        if t.lower().startswith('0x'):
+            t = t[2:]
+        if not t:
+            return None
+        try:
+            v = int(t, 16)
+        except ValueError:
+            raise ValueError(f"Invalid address: '{text}'")
+        if not (0 <= v <= 0xFFFFFF):
+            raise ValueError("Address must fit in 3 bytes (00:0000 - FF:FFFF)")
+        return v
+
+    def build_firmware_blob(self, entries, struct_addr, code_addr=None):
+        """Собирает бинарный блок прошивки.
+ 
+        entries — список пар (layer_idx, owner_idx) в порядке экспорта.
+            owner_idx == layer_idx  -> слой имеет собственный байт-код;
+            owner_idx != layer_idx  -> структура слоя ссылается на байт-код слоя owner_idx
+                                       (байт-код пишется один раз).
+        Структура (8 байт на слой):
+            [4 байта: x_start, block_start, x_end, block_end]
+            [4 байта: адрес байт-кода в обратном порядке, старший байт = 00]
+        Байт-коды идут после таблицы структур (или с code_addr) в порядке
+        первого обращения к ним из таблицы.
+        Возвращает (blob, rows), rows: (name, struct_addr, code_addr, size, shared_with_name|None)
+        """
+        n = len(entries)
+        table_size = n * 8
+        table_end = struct_addr + table_size
+        if code_addr is None:
+            code_addr = table_end
+        elif code_addr < table_end:
+            raise ValueError(
+                f"Bytecode address {self._fmt_addr(code_addr)} overlaps the structure table "
+                f"(ends at {self._fmt_addr(table_end)})")
+ 
+        table = bytearray()
+        code = bytearray()
+        rows = []
+        code_addrs = {}          # owner_idx -> адрес байт-кода
+        cur = code_addr
+        for i, (idx, owner) in enumerate(entries):
+            layer = self.layers[idx]
+            if owner not in code_addrs:
+                data = bytes(self.layers[owner].image_data)
+                if cur + len(data) > 0x1000000:
+                    raise ValueError("Bytecode exceeds the 24-bit address space")
+                code_addrs[owner] = cur
+                code += data
+                cur += len(data)
+            addr = code_addrs[owner]
+            header = bytes(layer.image_params)          # 4 байта
+            table += header + self._addr_to_ptr_bytes(addr)
+            shared = self.layers[owner].name if owner != idx else None
+            rows.append((layer.name, struct_addr + i * 8, addr,
+                         len(self.layers[owner].image_data), shared))
+ 
+        gap = bytes(code_addr - table_end)
+        return bytes(table) + gap + bytes(code), rows
+ 
+    def show_firmware_export_dialog(self):
+        """Окно экспорта структур картинок и байт-кодов в прошивку.
+        Выбор слоёв, их порядок, общий байт-код, горячие клавиши и подсказки."""
+        candidates = [i for i, l in enumerate(self.layers)
+                      if l.image_params is not None and l.image_data is not None]
+        if not candidates:
+            messagebox.showwarning("Export", "No layers with images to export")
+            return
+ 
+        win = tk.Toplevel(self.root)
+        win.title("Export Firmware Structures")
+        win.geometry("880x760")
+        win.transient(self.root)
+        win.grab_set()
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        win.rowconfigure(3, weight=1)
+ 
+        # ---- состояние ----
+        order = list(candidates)                         # порядок экспорта
+        # по умолчанию отмечены только видимые слои; скрытые можно отметить вручную
+        inc = {i: bool(self.layers[i].visible) for i in candidates}
+        owner = {i: i for i in candidates}               # чей байт-код использует слой
+ 
+        def lname(i):
+            return self.layers[i].name
+ 
+        def normalize():
+            """Если владелец байт-кода исключён — передаём владение первому из зависимых."""
+            for m in order:
+                followers = [i for i in order if i != m and owner[i] == m]
+                if followers and not inc[m]:
+                    alive = [i for i in followers if inc[i]]
+                    new_owner = alive[0] if alive else None
+                    for i in followers:
+                        owner[i] = new_owner if (new_owner is not None and inc[i]) else i
+ 
+        # ---- всплывающие подсказки ----
+        def add_tip(widget, text):
+            tip = {'win': None, 'job': None}
+ 
+            def show():
+                tip['job'] = None
+                if tip['win'] is not None:
+                    return
+                t = tk.Toplevel(widget)
+                t.wm_overrideredirect(True)
+                t.wm_geometry(f"+{widget.winfo_rootx() + 12}+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+                tk.Label(t, text=text, justify=tk.LEFT, background="#FFFFE0", relief=tk.SOLID,
+                         borderwidth=1, wraplength=340, font=('Arial', 9)).pack()
+                tip['win'] = t
+ 
+            def hide(_e=None):
+                if tip['job'] is not None:
+                    widget.after_cancel(tip['job'])
+                    tip['job'] = None
+                if tip['win'] is not None:
+                    tip['win'].destroy()
+                    tip['win'] = None
+ 
+            def schedule(_e=None):
+                hide()
+                tip['job'] = widget.after(450, show)
+ 
+            widget.bind('<Enter>', schedule, add='+')
+            widget.bind('<Leave>', hide, add='+')
+            widget.bind('<ButtonPress>', hide, add='+')
+            widget.bind('<Destroy>', hide, add='+')
+ 
+        # ---- список слоёв ----
+        lf = ttk.LabelFrame(win, text="Layers — top to bottom = order of structures in the file", padding=8)
+        lf.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+ 
+        cols = ("n", "name", "size", "exp", "code")
+        tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="browse", height=9)
+        for c, t, w, a in (("n", "#", 36, "center"), ("name", "Layer", 190, "w"),
+                           ("size", "Size", 120, "w"), ("exp", "Export", 55, "center"),
+                           ("code", "Bytecode source", 220, "w")):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor=a, stretch=(c in ("name", "code")))
+        tree.grid(row=0, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=tree.yview)
+        tsb.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=tsb.set)
+        tree.tag_configure("off", foreground="gray")
+        tree.tag_configure("shared", foreground="#1a5fb4")
+        add_tip(tree, "Layer list. ↑/↓ — move the cursor, Space — include/exclude the layer.\n"
+                      "Grey = not exported. Blue = uses another layer's bytecode.\n"
+                      "Hotkeys work while this list has focus.")
+ 
+        ttk.Label(lf, foreground="gray", justify=tk.LEFT,
+                  text="Space — include/exclude   Ctrl+↑/↓ — move layer   Ctrl+Home/End — to top/bottom\n"
+                       "S — use another layer's bytecode   U — make bytecode separate   A — auto-find duplicates\n"
+                       "Ctrl+A / Ctrl+D — include / exclude all   Ctrl+S — save .bin   Ctrl+Shift+C — copy hex"
+                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+ 
+        # ---- действия ----
+        def selected():
+            sel = tree.selection()
+            return int(sel[0]) if sel else None
+ 
+        def in_entry():
+            return isinstance(win.focus_get(), (tk.Entry, ttk.Entry))
+ 
+        def move(delta):
+            i = selected()
+            if i is None:
+                return
+            p = order.index(i)
+            q = p + delta
+            if 0 <= q < len(order):
+                order[p], order[q] = order[q], order[p]
+                refresh(keep=i)
+ 
+        def move_edge(to_top):
+            i = selected()
+            if i is None:
+                return
+            order.remove(i)
+            if to_top:
+                order.insert(0, i)
+            else:
+                order.append(i)
+            refresh(keep=i)
+ 
+        def toggle_export(_e=None):
+            i = selected()
+            if i is None:
+                return
+            inc[i] = not inc[i]
+            if not inc[i]:
+                owner[i] = i
+            refresh(keep=i)
+ 
+        def share_candidates(i):
+            data = bytes(self.layers[i].image_data)
+            return [j for j in order if j != i and inc[j] and owner[j] == j
+                    and bytes(self.layers[j].image_data) == data]
+ 
+        def set_owner(i, j):
+            for k in order:                      # зависимые от i переезжают к j
+                if k != i and owner[k] == i:
+                    owner[k] = j
+            owner[i] = j
+            refresh(keep=i)
+ 
+        def share_menu():
+            i = selected()
+            if i is None:
+                return
+            if not inc[i]:
+                messagebox.showinfo("Use same bytecode",
+                                    "This layer is not marked for export.\n"
+                                    "Include it first (Space).", parent=win)
+                return
+            cands = share_candidates(i)
+            if not cands:
+                messagebox.showinfo(
+                    "Use same bytecode",
+                    "No other exported layer has identical image data,\n"
+                    "so there is nothing to share with.", parent=win)
+                return
+            m = tk.Menu(win, tearoff=0)
+            m.add_command(label=f"'{lname(i)}' should use the bytecode of:", state=tk.DISABLED)
+            m.add_separator()
+            for j in cands:
+                m.add_command(label=f"   {lname(j)}", command=lambda j=j: set_owner(i, j))
+            bb = tree.bbox(str(i))
+            if bb:
+                x = tree.winfo_rootx() + bb[0] + 60
+                y = tree.winfo_rooty() + bb[1] + bb[3]
+            else:
+                x, y = win.winfo_pointerx(), win.winfo_pointery()
+            try:
+                m.tk_popup(x, y)
+            finally:
+                m.grab_release()
+ 
+        def unshare(_e=None):
+            i = selected()
+            if i is None:
+                return
+            if owner[i] == i:
+                # слой — владелец: все, кто на него ссылался, снова получают свой байт-код
+                for k in order:
+                    if k != i and owner[k] == i:
+                        owner[k] = k
+            else:
+                owner[i] = i
+            refresh(keep=i)
+ 
+        def auto_share():
+            """Слои с одинаковыми данными -> общий байт-код (владелец — первый по порядку)."""
+            groups = {}
+            for i in order:
+                if inc[i]:
+                    groups.setdefault(bytes(self.layers[i].image_data), []).append(i)
+            for g in groups.values():
+                for i in g:
+                    owner[i] = g[0]
+            refresh()
+ 
+        def unshare_all():
+            for i in order:
+                owner[i] = i
+            refresh()
+ 
+        def set_all(v):
+            for i in order:
+                inc[i] = v
+            if not v:
+                for i in order:
+                    owner[i] = i
+            refresh()
+ 
+        # ---- боковая панель кнопок ----
+        side = ttk.Frame(lf)
+        side.grid(row=0, column=2, sticky="n", padx=(10, 0))
+ 
+        def make_btn(parent, text, cmd, tip):
+            def run():
+                cmd()
+                tree.focus_set()
+            b = ttk.Button(parent, text=text, width=30, command=run)
+            b.pack(pady=1)
+            add_tip(b, tip)
+            return b
+ 
+        g1 = ttk.LabelFrame(side, text="Order in file", padding=4)
+        g1.pack(fill=tk.X, pady=(0, 4))
+        make_btn(g1, "▲ Move up   (Ctrl+↑)", lambda: move(-1),
+                 "Move the selected layer one position up.\nIts structure will be earlier in the exported table.")
+        make_btn(g1, "▼ Move down   (Ctrl+↓)", lambda: move(1),
+                 "Move the selected layer one position down.")
+ 
+        g2 = ttk.LabelFrame(side, text="What to export", padding=4)
+        g2.pack(fill=tk.X, pady=(0, 4))
+        make_btn(g2, "Include / exclude   (Space)", toggle_export,
+                 "Mark the selected layer for export or remove the mark.\nDouble-click on a row does the same.")
+        make_btn(g2, "Include all   (Ctrl+A)", lambda: set_all(True),
+                 "Mark all layers for export, including hidden ones.")
+        make_btn(g2, "Exclude all   (Ctrl+D)", lambda: set_all(False),
+                 "Remove the export mark from all layers.")
+ 
+        g3 = ttk.LabelFrame(side, text="Shared bytecode", padding=4)
+        g3.pack(fill=tk.X)
+        make_btn(g3, "Use bytecode of other layer…   (S)", share_menu,
+                 "Use when the same picture is drawn in different places.\n"
+                 "The selected layer keeps its own position/size in the structure,\n"
+                 "but points to the bytecode of another layer, so the bytecode\n"
+                 "is written to the file only once.\n"
+                 "Only layers with identical image data are offered.")
+        make_btn(g3, "Make bytecode separate   (U)", unshare,
+                 "Cancel sharing for the selected layer: it gets its own copy of bytecode.\n"
+                 "If other layers use this layer's bytecode, they become separate.")
+        make_btn(g3, "Auto-find duplicates   (A)", auto_share,
+                 "Find exported layers with identical image data and make them\n"
+                 "share one bytecode (the first one in the list owns it).")
+        make_btn(g3, "Make all separate   (Shift+U)", unshare_all,
+                 "Cancel all sharing: every exported layer has its own bytecode.")
+ 
+        # ---- адреса ----
+        af = ttk.LabelFrame(win, text="Addresses (hex, e.g. FB0000 or FB:0000)", padding=8)
+        af.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+ 
+        ttk.Label(af, text="Structures start:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        struct_var = tk.StringVar(value="FB0000")
+        e1 = ttk.Entry(af, textvariable=struct_var, width=14, font=('Courier', 10))
+        e1.grid(row=0, column=1, sticky=tk.W, padx=8)
+        add_tip(e1, "Address in the firmware where the table of structures\n(8 bytes per layer) begins.")
+ 
+        ttk.Label(af, text="Bytecode start:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        code_var = tk.StringVar(value="")
+        e2 = ttk.Entry(af, textvariable=code_var, width=14, font=('Courier', 10))
+        e2.grid(row=1, column=1, sticky=tk.W, padx=8)
+        add_tip(e2, "Address where the image bytecode begins.\nLeave empty to place it right after the table of structures.")
+        ttk.Label(af, text="(empty = right after the structure table)",
+                  foreground="gray").grid(row=1, column=2, sticky=tk.W)
+ 
+        ttk.Label(win, text="Structure: 4 bytes header (x_start, y_block_start, x_end, y_block_end) "
+                            "+ 4 bytes bytecode address, reversed (FB:0000 → 00 00 FB 00). "
+                            "Layers that share bytecode point to the same address; "
+                            "the bytecode is exported once.",
+                  foreground="gray", wraplength=840, justify=tk.LEFT).grid(
+            row=2, column=0, sticky="w", padx=12, pady=2)
+ 
+        # ---- предпросмотр ----
+        pf = ttk.LabelFrame(win, text="Preview of the exported file", padding=6)
+        pf.grid(row=3, column=0, sticky="nsew", padx=10, pady=4)
+        pf.columnconfigure(0, weight=1)
+        pf.rowconfigure(0, weight=1)
+        preview = tk.Text(pf, font=('Courier', 9), wrap=tk.NONE, state=tk.DISABLED, height=10)
+        preview.grid(row=0, column=0, sticky="nsew")
+        psb = ttk.Scrollbar(pf, orient=tk.VERTICAL, command=preview.yview)
+        psb.grid(row=0, column=1, sticky="ns")
+        preview.configure(yscrollcommand=psb.set)
+ 
+        state = {'blob': None}
+ 
+        def refresh(*_, keep=None):
+            normalize()
+            if keep is None:
+                keep = selected()
+            if keep is None and order:
+                keep = order[0]
+ 
+            # --- таблица ---
+            tree.delete(*tree.get_children())
+            pos = 0
+            for i in order:
+                layer = self.layers[i]
+                xs, bs, xe, be = layer.image_params
+                size = f"{xe - xs + 1}x{(be - bs + 1) * 8}, {len(layer.image_data)} B"
+                if inc[i]:
+                    pos += 1
+                    num = str(pos)
+                    if owner[i] != i:
+                        code, tag = f"same as: {lname(owner[i])}", ("shared",)
+                    else:
+                        n_f = sum(1 for k in order if k != i and inc[k] and owner[k] == i)
+                        code = f"own (used by {n_f} more)" if n_f else "own"
+                        tag = ()
+                else:
+                    num, code, tag = "", "— not exported —", ("off",)
+                tree.insert("", tk.END, iid=str(i),
+                            values=(num, layer.name, size, "✓" if inc[i] else "", code),
+                            tags=tag)
+            if keep is not None and tree.exists(str(keep)):
+                tree.selection_set(str(keep))
+                tree.focus(str(keep))
+                tree.see(str(keep))
+ 
+            # --- предпросмотр ---
+            state['blob'] = None
+            lines = []
+            try:
+                entries = [(i, owner[i]) for i in order if inc[i]]
+                if not entries:
+                    raise ValueError("No layers selected")
+                s_addr = self._parse_addr(struct_var.get())
+                if s_addr is None:
+                    raise ValueError("Enter structures start address")
+                c_addr = self._parse_addr(code_var.get())
+                blob, rows = self.build_firmware_blob(entries, s_addr, c_addr)
+                state['blob'] = blob
+                lines.append(f"Total: {len(blob)} bytes, "
+                             f"{self._fmt_addr(s_addr)} - {self._fmt_addr(s_addr + len(blob) - 1)}")
+                lines.append("")
+                for name, sa, ca, size, shared in rows:
+                    off = sa - s_addr
+                    rec = blob[off:off + 8]
+                    note = (f"shared with '{shared}'" if shared else f"{size} bytes")
+                    lines.append(f"{self._fmt_addr(sa)}  {' '.join(f'{b:02X}' for b in rec)}"
+                                 f"   ; {name} -> code {self._fmt_addr(ca)} ({note})")
+            except ValueError as e:
+                lines = [f"! {e}"]
+            preview.config(state=tk.NORMAL)
+            preview.delete('1.0', tk.END)
+            preview.insert('1.0', '\n'.join(lines))
+            preview.config(state=tk.DISABLED)
+ 
+        struct_var.trace_add('write', lambda *a: refresh())
+        code_var.trace_add('write', lambda *a: refresh())
+ 
+        # ---- кнопки внизу ----
+        bf = ttk.Frame(win)
+        bf.grid(row=4, column=0, pady=10)
+ 
+        def save_bin(_e=None):
+            if state['blob'] is None:
+                messagebox.showwarning("Export", "Nothing to export — fix the errors first", parent=win)
+                return
+            filename = filedialog.asksaveasfilename(
+                parent=win, title="Save firmware structures",
+                defaultextension=".bin",
+                filetypes=[("Binary files", "*.bin"), ("All files", "*.*")])
+            if not filename:
+                return
+            try:
+                with open(filename, 'wb') as f:
+                    f.write(state['blob'])
+                self.log_info(f"Firmware structures exported: {filename} ({len(state['blob'])} bytes)")
+                self.set_status(f"Exported {os.path.basename(filename)}")
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Cannot save file: {e}", parent=win)
+ 
+        def copy_hex(_e=None):
+            if state['blob'] is None:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(state['blob'].hex().upper())
+            self.set_status("Firmware blob copied to clipboard (hex)")
+ 
+        b_save = ttk.Button(bf, text="Save as .bin…   (Ctrl+S)", width=24, command=save_bin)
+        b_save.pack(side=tk.LEFT, padx=6)
+        add_tip(b_save, "Save the structure table and the bytecode to a binary file.")
+        b_copy = ttk.Button(bf, text="Copy as hex   (Ctrl+Shift+C)", width=26, command=copy_hex)
+        b_copy.pack(side=tk.LEFT, padx=6)
+        add_tip(b_copy, "Copy the whole exported data to the clipboard as a hex string.")
+        b_close = ttk.Button(bf, text="Close   (Esc)", width=14, command=win.destroy)
+        b_close.pack(side=tk.LEFT, padx=6)
+ 
+        # ---- горячие клавиши ----
+        # Буквенные клавиши продублированы для русской раскладки (Tk даёт Cyrillic-keysym).
+        def bind_keys(widget, prefix, keysyms, func):
+            for ks in keysyms:
+                try:
+                    widget.bind(f"<{prefix}Key-{ks}>", func)
+                except tk.TclError:
+                    pass
+ 
+        def brk(func):
+            def handler(_e=None):
+                func()
+                return "break"
+            return handler
+ 
+        # Навигация ↑/↓ — штатная для Treeview; здесь — остальное (только когда фокус на списке)
+        tree.bind("<space>", brk(toggle_export))
+        tree.bind("<Control-Up>", brk(lambda: move(-1)))
+        tree.bind("<Control-Down>", brk(lambda: move(1)))
+        tree.bind("<Alt-Up>", brk(lambda: move(-1)))
+        tree.bind("<Alt-Down>", brk(lambda: move(1)))
+        tree.bind("<Control-Home>", brk(lambda: move_edge(True)))
+        tree.bind("<Control-End>", brk(lambda: move_edge(False)))
+        tree.bind("<Return>", brk(toggle_export))
+        bind_keys(tree, "", ["s", "S", "Cyrillic_yeru", "Cyrillic_YERU"], brk(share_menu))
+        bind_keys(tree, "", ["u", "Cyrillic_ghe"], brk(unshare))
+        bind_keys(tree, "", ["U", "Cyrillic_GHE"], brk(unshare_all))
+        bind_keys(tree, "", ["a", "A", "Cyrillic_ef", "Cyrillic_EF"], brk(auto_share))
+        tree.bind("<Double-1>", toggle_export)
+ 
+        # Глобальные для окна (не мешают вводу адресов)
+        def guarded(func):
+            def handler(_e=None):
+                if not in_entry():
+                    func()
+                    return "break"
+            return handler
+ 
+        bind_keys(win, "Control-", ["a", "Cyrillic_ef"], guarded(lambda: set_all(True)))
+        bind_keys(win, "Control-", ["d", "Cyrillic_ve"], guarded(lambda: set_all(False)))
+        bind_keys(win, "Control-", ["s", "Cyrillic_yeru"], lambda e: (save_bin(), "break")[1])
+        bind_keys(win, "Control-", ["C", "Cyrillic_ES"], lambda e: (copy_hex(), "break")[1])
+        win.bind('<Escape>', lambda e: win.destroy())
+ 
+        refresh()
+        tree.focus_set()
+ 
+    # ==================== КОНЕЦ ЭКСПОРТА В ПРОШИВКУ ====================
+
+    # ==================== ИЗМЕНЕНИЕ РАЗМЕРА СЛОЯ ====================
+
+    @staticmethod
+    def _unpack_layer_pixels(data, width, n_blocks):
+        """Байты слоя -> 2D-список пикселей [row][col] (1 = чёрный).
+        Раскладка данных: byte_idx = block * width + col, бит 0 = верхний пиксель блока."""
+        height = n_blocks * 8
+        pixels = [[0] * width for _ in range(height)]
+        for blk in range(n_blocks):
+            for col in range(width):
+                idx = blk * width + col
+                if idx >= len(data):
+                    break
+                b = data[idx]
+                for bit in range(8):
+                    if b & (1 << bit):
+                        pixels[blk * 8 + bit][col] = 1
+        return pixels
+
+    @staticmethod
+    def _pack_layer_pixels(pixels, width, n_blocks):
+        """2D-список пикселей -> bytearray в раскладке слоя."""
+        data = bytearray(width * n_blocks)
+        for blk in range(n_blocks):
+            for col in range(width):
+                b = 0
+                for bit in range(8):
+                    if pixels[blk * 8 + bit][col]:
+                        b |= (1 << bit)
+                data[blk * width + col] = b
+        return data
+
+    @classmethod
+    def resize_layer_data(cls, data, params, new_width, new_blocks, stretch=False):
+        """Возвращает (new_data, new_params) для нового размера.
+        stretch=False: пиксели остаются на месте (левый верхний угол), лишнее обрезается,
+                       новое поле заполняется белым (0).
+        stretch=True:  изображение масштабируется (nearest neighbour) на весь новый размер."""
+        x_start, block_start, x_end, block_end = params
+        old_w = x_end - x_start + 1
+        old_blocks = block_end - block_start + 1
+        old_h = old_blocks * 8
+        new_h = new_blocks * 8
+
+        src = cls._unpack_layer_pixels(data, old_w, old_blocks)
+        dst = [[0] * new_width for _ in range(new_h)]
+        if stretch:
+            for y in range(new_h):
+                sy = y * old_h // new_h
+                for x in range(new_width):
+                    dst[y][x] = src[sy][x * old_w // new_width]
+        else:
+            for y in range(min(old_h, new_h)):
+                for x in range(min(old_w, new_width)):
+                    dst[y][x] = src[y][x]
+
+        new_data = cls._pack_layer_pixels(dst, new_width, new_blocks)
+        new_params = (x_start, block_start,
+                      x_start + new_width - 1, block_start + new_blocks - 1)
+        return new_data, new_params
+
+    def show_resize_layer_dialog(self):
+        """Диалог изменения размера активного слоя (правая кнопка по слою)."""
+        if self.active_layer_index == -1 or not self.layers:
+            messagebox.showwarning("Warning", "No active layer selected")
+            return
+        layer = self.layers[self.active_layer_index]
+        if layer.image_params is None or layer.image_data is None:
+            messagebox.showwarning("Warning", "Layer has no image data")
+            return
+
+        x_start, block_start, x_end, block_end = layer.image_params
+        cur_w = x_end - x_start + 1
+        cur_h = (block_end - block_start + 1) * 8
+        # Слой не должен выходить за экран (и параметры должны влезать в байт)
+        max_w = max(1, min(self.screen_width - x_start, 256 - x_start))
+        max_h = max(8, ((self.screen_height - block_start * 8) // 8) * 8)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Resize Layer")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        pad = {'padx': 10, 'pady': 5}
+        ttk.Label(dlg, text=f"Layer: {layer.name}", font=('Arial', 10, 'bold')).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, padx=10, pady=(10, 2))
+        ttk.Label(dlg, text=f"Current size: {cur_w} x {cur_h} px  "
+                            f"({cur_h // 8} blocks, {len(layer.image_data)} bytes)",
+                  foreground="gray").grid(row=1, column=0, columnspan=3, sticky=tk.W, padx=10)
+
+        w_var = tk.IntVar(value=cur_w)
+        h_var = tk.IntVar(value=cur_h)
+
+        ttk.Label(dlg, text="Width (px):").grid(row=2, column=0, sticky=tk.W, **pad)
+        ttk.Spinbox(dlg, from_=1, to=max_w, increment=1, width=8, textvariable=w_var,
+                    font=('Arial', 10)).grid(row=2, column=1, sticky=tk.W, **pad)
+        ttk.Label(dlg, text=f"max {max_w}", foreground="gray").grid(row=2, column=2, sticky=tk.W)
+
+        ttk.Label(dlg, text="Height (px):").grid(row=3, column=0, sticky=tk.W, **pad)
+        ttk.Spinbox(dlg, from_=8, to=max_h, increment=8, width=8, textvariable=h_var,
+                    font=('Arial', 10)).grid(row=3, column=1, sticky=tk.W, **pad)
+        ttk.Label(dlg, text=f"multiple of 8, max {max_h}", foreground="gray").grid(
+            row=3, column=2, sticky=tk.W)
+
+        mode_var = tk.StringVar(value="crop")
+        mf = ttk.LabelFrame(dlg, text="Content", padding=6)
+        mf.grid(row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
+        ttk.Radiobutton(mf, text="Keep pixels (crop / pad with white, top-left anchor)",
+                        variable=mode_var, value="crop").pack(anchor=tk.W)
+        ttk.Radiobutton(mf, text="Stretch image to the new size",
+                        variable=mode_var, value="stretch").pack(anchor=tk.W)
+
+        def apply():
+            try:
+                new_w = int(w_var.get())
+                new_h = int(h_var.get())
+            except (tk.TclError, ValueError):
+                messagebox.showwarning("Invalid size", "Enter integer values.", parent=dlg)
+                return
+            if new_w < 1 or new_w > max_w:
+                messagebox.showwarning("Invalid size",
+                                       f"Width must be 1..{max_w}.", parent=dlg)
+                return
+            if new_h < 1 or new_h > max_h:
+                messagebox.showwarning("Invalid size",
+                                       f"Height must be 1..{max_h}.", parent=dlg)
+                return
+            new_blocks = (new_h + 7) // 8      # высота всегда кратна 8 — округляем вверх
+            if new_blocks * 8 > max_h:
+                new_blocks = max_h // 8
+
+            if new_w == cur_w and new_blocks * 8 == cur_h:
+                dlg.destroy()
+                return
+
+            self.save_state_for_undo(f"Resize '{layer.name}' to {new_w}x{new_blocks * 8}")
+            new_data, new_params = self.resize_layer_data(
+                layer.image_data, layer.image_params, new_w, new_blocks,
+                stretch=(mode_var.get() == "stretch"))
+            layer.image_data = new_data
+            layer.image_params = new_params
+            self.update_layer_hex_string(layer)
+            self.recreate_layer_image(layer)     # данные изменились — перерисовываем всегда
+            self.update_active_layer_display()
+            self.combine_layers()
+            self.log_info(f"Layer '{layer.name}' resized {cur_w}x{cur_h} -> "
+                          f"{new_w}x{new_blocks * 8} ({len(new_data)} bytes)")
+            self.set_status(f"Layer resized to {new_w}x{new_blocks * 8}")
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=5, column=0, columnspan=3, pady=10)
+        ttk.Button(bf, text="Apply", width=10, command=apply).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="Cancel", width=10, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
+        dlg.bind('<Return>', lambda e: apply())
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+    # ==================== КОНЕЦ ИЗМЕНЕНИЯ РАЗМЕРА СЛОЯ ====================
+
+    # ==================== ЭКСПОРТ ОТДЕЛЬНОГО СЛОЯ ====================
+
+    def _get_exportable_active_layer(self):
+        """Возвращает активный слой с изображением или None (с предупреждением)."""
+        if self.active_layer_index == -1 or not self.layers:
+            messagebox.showwarning("Export", "No active layer selected")
+            return None
+        layer = self.layers[self.active_layer_index]
+        if layer.image_params is None or layer.image_data is None:
+            messagebox.showwarning("Export", "Layer has no image data")
+            return None
+        return layer
+
+    @staticmethod
+    def _safe_filename(name):
+        s = ''.join(c if (c.isalnum() or c in '-_.') else '_' for c in name.strip())
+        return s or "layer"
+
+    def export_layer_image(self):
+        """Экспорт изображения только активного слоя (обрезано по рамке слоя)."""
+        layer = self._get_exportable_active_layer()
+        if layer is None:
+            return
+
+        x_start, block_start, x_end, block_end = layer.image_params
+        width = x_end - x_start + 1
+        n_blocks = block_end - block_start + 1
+        pixels = self._unpack_layer_pixels(layer.image_data, width, n_blocks)
+        arr = np.array([[0 if p else 255 for p in row] for row in pixels], dtype=np.uint8)
+
+        filename = filedialog.asksaveasfilename(
+            title=f"Export Layer Image — {layer.name}",
+            initialfile=self._safe_filename(layer.name) + ".png",
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("BMP files", "*.bmp"),
+                       ("JPEG files", "*.jpg"), ("All files", "*.*")])
+        if not filename:
+            return
+        try:
+            Image.fromarray(arr).save(filename)
+            self.log_info(f"Layer '{layer.name}' image exported to: {filename} "
+                          f"({width}x{n_blocks * 8} px)")
+            self.set_status(f"Layer image saved as {os.path.basename(filename)}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Cannot save image: {e}")
+
+    def export_layer_bytes(self):
+        """Окно экспорта байтов активного слоя: .bin / hex-текст / C-массив."""
+        layer = self._get_exportable_active_layer()
+        if layer is None:
+            return
+
+        header = bytes(layer.image_params)
+        data = bytes(layer.image_data)
+        base = self._safe_filename(layer.name)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Export Layer Bytes")
+        dlg.geometry("560x420")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(2, weight=1)
+
+        ttk.Label(dlg, text=f"Layer: {layer.name}", font=('Arial', 10, 'bold')).grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=(10, 2))
+
+        opt = ttk.LabelFrame(dlg, text="Options", padding=8)
+        opt.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        inc_header = tk.BooleanVar(value=True)
+        fmt_var = tk.StringVar(value="bin")
+        ttk.Checkbutton(opt, text="Include 4-byte header (x_start, block_start, x_end, block_end)",
+                        variable=inc_header, command=lambda: refresh()).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W)
+        for col, (text, val) in enumerate([("Binary (.bin)", "bin"),
+                                           ("Hex text (.txt)", "hex"),
+                                           ("C array (.h)", "c")]):
+            ttk.Radiobutton(opt, text=text, variable=fmt_var, value=val,
+                            command=lambda: refresh()).grid(row=1, column=col, sticky=tk.W,
+                                                            padx=(0, 14), pady=(6, 0))
+
+        pf = ttk.LabelFrame(dlg, text="Preview", padding=6)
+        pf.grid(row=2, column=0, sticky="nsew", padx=10, pady=4)
+        pf.columnconfigure(0, weight=1)
+        pf.rowconfigure(0, weight=1)
+        preview = tk.Text(pf, font=('Courier', 9), wrap=tk.WORD, state=tk.DISABLED, height=10)
+        preview.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(pf, orient=tk.VERTICAL, command=preview.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        preview.configure(yscrollcommand=sb.set)
+
+        def payload():
+            return (header + data) if inc_header.get() else data
+
+        def as_hex(b):
+            return ' '.join(f'{x:02X}' for x in b)
+
+        def as_c(b):
+            name = 'img_' + ''.join(c if c.isalnum() else '_' for c in base).lower()
+            if name[4:5].isdigit():
+                name = 'img__' + name[4:]
+            lines = []
+            for i in range(0, len(b), 12):
+                lines.append('    ' + ', '.join(f'0x{x:02X}' for x in b[i:i + 12]))
+            return (f"const unsigned char {name}[{len(b)}] = {{\n"
+                    + ',\n'.join(lines) + "\n};\n")
+
+        def render():
+            b = payload()
+            f = fmt_var.get()
+            if f == "hex":
+                return as_hex(b)
+            if f == "c":
+                return as_c(b)
+            return as_hex(b)
+
+        def refresh(*_):
+            b = payload()
+            text = f"{len(b)} bytes\n\n{render()}"
+            preview.config(state=tk.NORMAL)
+            preview.delete('1.0', tk.END)
+            preview.insert('1.0', text)
+            preview.config(state=tk.DISABLED)
+
+        def save():
+            f = fmt_var.get()
+            ext, ftypes = {
+                "bin": (".bin", [("Binary files", "*.bin")]),
+                "hex": (".txt", [("Text files", "*.txt")]),
+                "c":   (".h",   [("C header", "*.h")]),
+            }[f]
+            filename = filedialog.asksaveasfilename(
+                parent=dlg, title="Save layer bytes", initialfile=base + ext,
+                defaultextension=ext, filetypes=ftypes + [("All files", "*.*")])
+            if not filename:
+                return
+            try:
+                if f == "bin":
+                    with open(filename, 'wb') as fh:
+                        fh.write(payload())
+                else:
+                    with open(filename, 'w', encoding='utf-8') as fh:
+                        fh.write(render() + "\n")
+                self.log_info(f"Layer '{layer.name}' bytes exported: {filename} "
+                              f"({len(payload())} bytes)")
+                self.set_status(f"Layer bytes saved as {os.path.basename(filename)}")
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Cannot save file: {e}", parent=dlg)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(render())
+            self.set_status("Layer bytes copied to clipboard")
+
+        bf = ttk.Frame(dlg)
+        bf.grid(row=3, column=0, pady=10)
+        ttk.Button(bf, text="Save...", width=12, command=save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="Copy", width=12, command=copy).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="Close", width=12, command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        refresh()
+
+    # ==================== КОНЕЦ ЭКСПОРТА ОТДЕЛЬНОГО СЛОЯ ====================
+
     def show_hotkeys(self):
         """Показывает окно с горячими клавишами."""
         win = tk.Toplevel(self.root)
@@ -827,7 +1757,7 @@ class ImageDisplayApp:
 
     def show_about(self):
         """Показывает окно 'О программе'"""
-        messagebox.showinfo("About", "Byte2Image Editor\n\nVersion 0.6.5\n\nDENSO Hex image editor with layer support\n\nBy McShel")
+        messagebox.showinfo("About", "Byte2Image Editor\n\nVersion 0.7.0\n\nDENSO Hex image editor with layer support\n\nBy McShel")
         
     def setup_ui(self):
         # Настройка растягивания корневого окна
@@ -838,6 +1768,7 @@ class ImageDisplayApp:
         # ТУЛБАР — на всю ширину окна, row=0
         # ====================
         toolbar_frame = ttk.Frame(self.root, padding=(4, 3))
+        self.toolbar_frame = toolbar_frame
         toolbar_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
 
         # Кнопки Undo/Redo
@@ -898,11 +1829,13 @@ class ImageDisplayApp:
         # ====================
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        
+        self.main_paned = main_paned
+
         # --------------------
         # ЛЕВАЯ ПАНЕЛЬ - Layers
         # --------------------
         left_frame = ttk.LabelFrame(main_paned, text="Layers", padding="5")
+        self.left_frame = left_frame
         left_frame.columnconfigure(0, weight=1)
         left_frame.rowconfigure(0, weight=1)
 
@@ -958,9 +1891,11 @@ class ImageDisplayApp:
         # ЦЕНТР - Display + Hex
         # --------------------
         center_paned = ttk.PanedWindow(main_paned, orient=tk.VERTICAL)
+        self.center_paned = center_paned
 
         # Верхняя часть центра - отображение
         center_top = ttk.Frame(center_paned)
+        self.center_top = center_top
         
         # Display area
         self.image_container = ttk.LabelFrame(center_top, text=f"Display ({self.screen_width}x{self.screen_height})", padding="5")
@@ -998,6 +1933,7 @@ class ImageDisplayApp:
         
         # Нижняя часть центра - Hex panel
         hex_frame = ttk.LabelFrame(center_paned, text="Active Layer Hex", padding="5")
+        self.hex_frame = hex_frame
 
         self.hex_entry = tk.Text(hex_frame, height=2, font=('Courier', 9), wrap=tk.WORD)
         self.hex_entry.pack(fill=tk.BOTH, expand=True)
@@ -1015,14 +1951,17 @@ class ImageDisplayApp:
         ttk.Button(hex_btn_frame, text="Paste", width=10,
                 command=self.paste_from_clipboard).pack(side=tk.LEFT, padx=2)
         
-        center_paned.add(hex_frame, weight=1)
-        
+        # Панель добавляется в paned только если включена (по умолчанию скрыта)
+        if self.show_hex_panel.get():
+            center_paned.add(hex_frame, weight=1)
+
         main_paned.add(center_paned, weight=8)
         
         # --------------------
         # ПРАВАЯ ПАНЕЛЬ - Log
         # --------------------
         right_frame = ttk.LabelFrame(main_paned, text="Log", padding="5")
+        self.right_frame = right_frame
 
         self.info_text = tk.Text(right_frame, height=15, font=('Courier', 8), wrap=tk.WORD)
         self.info_text.pack(fill=tk.BOTH, expand=True)
@@ -1039,7 +1978,10 @@ class ImageDisplayApp:
                 command=self.clear_info).pack(side=tk.LEFT, padx=2)
         
         main_paned.add(right_frame, weight=1)
-        
+
+        # Применяем начальную видимость панелей (Hex скрыт по умолчанию)
+        self.apply_panel_visibility()
+
         # Статус бар
         self.status_var = tk.StringVar()
         self.status_var.set("Ready - No layers")
@@ -1181,6 +2123,15 @@ class ImageDisplayApp:
                       command=lambda: self.on_layer_double_click(None))
         m.add_command(label="⧉  Duplicate Layer",
                       command=self.duplicate_active_layer)
+        m.add_command(label="⤢  Resize Layer...",
+                      command=self.show_resize_layer_dialog,
+                      state=tk.NORMAL if (layer.image_params is not None
+                                          and layer.image_data is not None) else tk.DISABLED)
+
+        m.add_separator()
+
+        # Экспорт слоя
+        m.add_cascade(label="💾  Export", menu=self._build_export_menu(m, layer))
 
         m.add_separator()
 
@@ -1432,6 +2383,9 @@ class ImageDisplayApp:
                           command=self.toggle_active_layer_visibility)
             m.add_command(label=f"⧉  Duplicate '{name}'",
                           command=self.duplicate_active_layer)
+            m.add_command(label=f"⤢  Resize '{name}'...",
+                          command=self.show_resize_layer_dialog,
+                          state=tk.NORMAL if has_image else tk.DISABLED)
             m.add_command(label=f"✕  Clear '{name}'",
                           command=self.clear_active_layer,
                           state=tk.NORMAL if has_image else tk.DISABLED)
@@ -1451,8 +2405,7 @@ class ImageDisplayApp:
 
         m.add_separator()
 
-        m.add_command(label="💾  Export Image...", command=self.export_to_image,
-                      state=tk.NORMAL if self.combined_image is not None else tk.DISABLED)
+        m.add_cascade(label="💾  Export", menu=self._build_export_menu(m, act_layer))
 
         if 0 <= px < self.screen_width and 0 <= py < self.screen_height:
             m.add_separator()
@@ -2315,7 +3268,7 @@ class ImageDisplayApp:
         
         if filename:
             try:
-                img = Image.fromarray(self.combined_image, mode='L')
+                img = Image.fromarray(self.combined_image)
                 img.save(filename)
                 self.log_info(f"Combined image exported to: {filename}")
                 self.set_status(f"Image saved as {os.path.basename(filename)}")
@@ -2330,7 +3283,7 @@ class ImageDisplayApp:
             canvas_height = self.screen_height * self.scale_factor
             self.canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
 
-            pil_image = Image.fromarray(image_array, mode='L')
+            pil_image = Image.fromarray(image_array)
             display_size = (canvas_width, canvas_height)
             pil_image = pil_image.resize(display_size, Image.NEAREST)
             
